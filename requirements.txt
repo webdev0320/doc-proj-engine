@@ -1,0 +1,14 @@
+easyocr
+pymupdf
+numpy
+pillow
+rapidfuzz
+fastapi
+uvicorn
+pydantic
+requests
+python-dotenv
+scikit-learn
+opencv-python-headless
+cryptography
+paramiko
