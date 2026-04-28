@@ -293,8 +293,9 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
             # Proactively upload to remote storage so Vercel can see it
             if storage_settings:
                 try:
+                    # Force leading slash if needed, or try both
                     remote_image_path = f"pages/{image_filename}"
-                    print(f">>> [PIPELINE] Uploading page {page_num} to remote...")
+                    print(f">>> [PIPELINE] Uploading page {page_num} to SFTP: {remote_image_path}")
                     upload_to_remote(image_path, remote_image_path, storage_settings)
                 except Exception as ue:
                     print(f"!!! [PIPELINE ERROR] Page upload failed: {ue}")

@@ -12,3 +12,4 @@ scikit-learn
 opencv-python-headless
 cryptography
 paramiko
+boto3
