@@ -157,9 +157,8 @@ async def process_document(req: ProcessRequest, background_tasks: BackgroundTask
             
         if req.storage_settings:
             try:
-                # UUIDs are 36 chars. Backend uses f"{uuid}-{originalName}"
-                # So we skip 36 chars + 1 hyphen = 37 chars
-                remote_filename = req.storage_path[37:] if (len(req.storage_path) > 37 and req.storage_path[36] == '-') else req.storage_path
+                # Use the storage_path directly as it is the remote filename
+                remote_filename = req.storage_path
                 print(f"File missing locally. Downloading {remote_filename} from remote...")
                 download_from_remote(remote_filename, pdf_path, req.storage_settings)
             except Exception as e:
@@ -187,7 +186,7 @@ async def process_append(req: AppendRequest, background_tasks: BackgroundTasks):
             os.remove(pdf_path)
         if req.storage_settings:
             try:
-                remote_filename = req.storage_path[37:] if (len(req.storage_path) > 37 and req.storage_path[36] == '-') else req.storage_path
+                remote_filename = req.storage_path
                 print(f"[APPEND] Downloading {remote_filename} from remote...")
                 download_from_remote(remote_filename, pdf_path, req.storage_settings)
             except Exception as e:
