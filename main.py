@@ -157,10 +157,18 @@ async def process_document(req: ProcessRequest, background_tasks: BackgroundTask
             
         if req.storage_settings:
             try:
-                # Use the storage_path directly as it is the remote filename
-                remote_filename = req.storage_path
-                print(f"File missing locally. Downloading {remote_filename} from remote...")
-                download_from_remote(remote_filename, pdf_path, req.storage_settings)
+                # Try downloading full path first (e.g. for Add Pages where remote has UUID)
+                print(f"[DEBUG] File missing locally. Trying remote download: {req.storage_path}")
+                try:
+                    download_from_remote(req.storage_path, pdf_path, req.storage_settings)
+                except Exception as e1:
+                    # Fallback: strip UUID (first 37 chars) for SFTP Poller flow
+                    if len(req.storage_path) > 37 and req.storage_path[36] == '-':
+                        stripped = req.storage_path[37:]
+                        print(f"[DEBUG] Full path failed, trying stripped: {stripped}")
+                        download_from_remote(stripped, pdf_path, req.storage_settings)
+                    else:
+                        raise e1
             except Exception as e:
                 print(f"[ERROR] Remote download failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to download file from remote storage: {e}")
@@ -180,16 +188,25 @@ async def process_append(req: AppendRequest, background_tasks: BackgroundTasks):
     Page indices start from req.page_offset so they don't collide with existing pages.
     """
     pdf_path = os.path.join(BLOBS_DIR, req.storage_path)
+    print(f"[DEBUG] Checking local path: {pdf_path}")
 
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
         if req.storage_settings:
             try:
-                remote_filename = req.storage_path
-                print(f"[APPEND] Downloading {remote_filename} from remote...")
-                download_from_remote(remote_filename, pdf_path, req.storage_settings)
+                print(f"[APPEND] File missing locally. Trying remote download: {req.storage_path}")
+                try:
+                    download_from_remote(req.storage_path, pdf_path, req.storage_settings)
+                except Exception as e1:
+                    if len(req.storage_path) > 37 and req.storage_path[36] == '-':
+                        stripped = req.storage_path[37:]
+                        print(f"[APPEND] Full path failed, trying stripped: {stripped}")
+                        download_from_remote(stripped, pdf_path, req.storage_settings)
+                    else:
+                        raise e1
             except Exception as e:
+                print(f"[APPEND ERROR] Remote download failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to download append file: {e}")
         else:
             raise HTTPException(status_code=404, detail="Append file not found and no storage settings provided.")
