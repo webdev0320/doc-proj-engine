@@ -69,6 +69,12 @@ class ExportRequest(BaseModel):
     manifest: list # list of {documentId, documentName, pages: [s3Path]}
     storage_settings: Optional[Dict[str, Any]] = None
 
+class AppendRequest(BaseModel):
+    blob_id: str
+    storage_path: str
+    page_offset: int = 0  # Starting page index to avoid collisions with existing pages
+    storage_settings: Optional[Dict[str, Any]] = None
+
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "idp-engine"}
@@ -166,6 +172,33 @@ async def process_document(req: ProcessRequest, background_tasks: BackgroundTask
     background_tasks.add_task(run_pipeline, req.blob_id, pdf_path, req.storage_settings)
     
     return {"success": True, "message": "OCR processing started in background"}
+
+
+@app.post("/process-append")
+async def process_append(req: AppendRequest, background_tasks: BackgroundTasks):
+    """
+    Appends new pages from a new file to an existing blob.
+    Page indices start from req.page_offset so they don't collide with existing pages.
+    """
+    pdf_path = os.path.join(BLOBS_DIR, req.storage_path)
+
+    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+        if os.path.exists(pdf_path):
+            os.remove(pdf_path)
+        if req.storage_settings:
+            try:
+                remote_filename = req.storage_path[37:] if (len(req.storage_path) > 37 and req.storage_path[36] == '-') else req.storage_path
+                print(f"[APPEND] Downloading {remote_filename} from remote...")
+                download_from_remote(remote_filename, pdf_path, req.storage_settings)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to download append file: {e}")
+        else:
+            raise HTTPException(status_code=404, detail="Append file not found and no storage settings provided.")
+
+    background_tasks.add_task(run_pipeline_append, req.blob_id, pdf_path, req.page_offset, req.storage_settings)
+    return {"success": True, "message": "Append processing started in background"}
+
+
 
 def scan_health_check(image_path):
     """Detects skew, brightness, and blur using OpenCV."""
@@ -332,6 +365,77 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
     except Exception as e:
         print(f"[ERROR] Pipeline failed: {e}")
         requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED"})
+
+def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_settings: Optional[Dict[str, Any]] = None):
+    """Processes a new file and appends its pages to an existing blob, starting from page_offset."""
+    try:
+        print(f">>> [APPEND] Starting for Blob: {blob_id}, offset: {page_offset}")
+        if not os.path.exists(pdf_path):
+            print(f"!!! [APPEND ERROR] File does not exist: {pdf_path}")
+            return
+
+        doc = fitz.open(pdf_path)
+        print(f">>> [APPEND] PDF opened. New pages: {len(doc)}")
+        page_records = []
+
+        for i in range(len(doc)):
+            abs_index = page_offset + i          # absolute index in the blob
+            page_num = abs_index + 1             # 1-based, unique per blob
+
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            image_filename = f"{blob_id}_{page_num}.png"
+            image_path = os.path.join(PAGES_DIR, image_filename)
+            pix.save(image_path)
+
+            if storage_settings:
+                try:
+                    upload_to_remote(image_path, f"pages/{image_filename}", storage_settings)
+                except Exception as ue:
+                    print(f"!!! [APPEND] Page upload failed: {ue}")
+
+            anomalies, blur_score, skew = scan_health_check(image_path)
+            pdf_text = page.get_text("text").strip()
+
+            try:
+                if len(pdf_text) > 20:
+                    ocr_text = pdf_text
+                    res = "NativeTextExtractor"
+                else:
+                    res = reader.readtext(image_path)
+                    ocr_text = " ".join([item[1] for item in res]) if res else ""
+            except:
+                ocr_text, res = "", None
+
+            text_blocks = [{'text': item[1], 'confidence': item[2]} for item in res] if (res and res != "NativeTextExtractor") else [{'text': ocr_text, 'confidence': 1.0}]
+            ai_label, fuzzy_confidence = classify_page(text_blocks)
+            confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
+            should_flag = confidence < 0.85 or len(anomalies) > 0
+            extracted = extract_mortgage_entities(ocr_text, ai_label)
+
+            page_records.append({
+                "page_index": abs_index,
+                "s3_path": image_filename,
+                "ai_label": ai_label,
+                "confidence_score": confidence,
+                "is_flagged": should_flag,
+                "anomaly_flags": json.dumps(anomalies),
+                "extracted_data": json.dumps(extracted)
+            })
+            print(f"[APPEND] Page {abs_index}: {ai_label} (Conf: {confidence})")
+
+        # Post back with mode=append so existing pages are NOT deleted
+        requests.post(
+            f"{BACKEND_URL}/api/blobs/{blob_id}/pages",
+            json={"pages": page_records, "mode": "append"}
+        )
+        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"})
+        doc.close()
+        print(f">>> [APPEND] Done. Added {len(page_records)} pages to blob {blob_id}")
+    except Exception as e:
+        print(f"[APPEND ERROR] Pipeline failed: {e}")
+        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED"})
+
 
 if __name__ == "__main__":
     import uvicorn
