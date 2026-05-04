@@ -1,10 +1,10 @@
 import os
 # STABILITY FLAGS
-os.environ['FLAGS_use_mkldnn'] = '0'
-os.environ['PADDLE_ONEDNN'] = 'OFF'
-os.environ['FLAGS_enable_new_executor'] = '0'
-os.environ['FLAGS_enable_new_ir'] = '0'
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 os.environ['OMP_NUM_THREADS'] = '1'
+# Disable Paddle specific flags if not using PaddleOCR library
+# os.environ['FLAGS_use_mkldnn'] = '0'
+# os.environ['PADDLE_ONEDNN'] = 'OFF'
 
 import shutil
 import requests
@@ -18,17 +18,24 @@ from io import BytesIO
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import easyocr
+# import easyocr  # Moved to lazy loading
 from paddleOCR import classify_page
 from crypto_utils import decrypt_file
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Initialize EasyOCR once at startup
-print("Loading EasyOCR model...")
-reader = easyocr.Reader(['en'], gpu=False)
-print("EasyOCR ready.")
+# Lazy-loaded EasyOCR reader
+_reader = None
+
+def get_reader():
+    global _reader
+    if _reader is None:
+        print(">>> [OCR] Loading EasyOCR model (this may take a moment)...")
+        import easyocr
+        _reader = easyocr.Reader(['en'], gpu=False)
+        print(">>> [OCR] EasyOCR ready.")
+    return _reader
 
 app = FastAPI(title="IDP Engine - PaddleOCR")
 
@@ -357,7 +364,8 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
                     ocr_text = pdf_text
                     res = "NativeTextExtractor"
                 else:
-                    res = reader.readtext(image_path)
+                    ocr_reader = get_reader()
+                    res = ocr_reader.readtext(image_path)
                     ocr_text = " ".join([item[1] for item in res]) if res else ""
             except:
                 ocr_text, res = "", None
@@ -418,7 +426,8 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
                     ocr_text = pdf_text
                     res = "NativeTextExtractor"
                 else:
-                    res = reader.readtext(image_path)
+                    ocr_reader = get_reader()
+                    res = ocr_reader.readtext(image_path)
                     ocr_text = " ".join([item[1] for item in res]) if res else ""
             except:
                 ocr_text, res = "", None
