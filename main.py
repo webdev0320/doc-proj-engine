@@ -14,6 +14,7 @@ import json
 import fitz
 import paramiko
 import boto3
+import re
 from io import BytesIO
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -244,15 +245,40 @@ def scan_health_check(image_path):
     if abs(skew_angle) > 5: issues.append("SKEWED")
     return issues, fm, skew_angle
 
-def extract_mortgage_entities(ocr_text, doc_type):
+def extract_entities(ocr_text, doc_type):
     data = {}
-    full_text = ocr_text.upper() if isinstance(ocr_text, str) else ""
-    if "W-2" in doc_type or "W2" in doc_type:
-        data = {"Employer_EIN": "12-3456789", "Box1_Wages": "85,400.00"}
-    elif "PAYSTUB" in doc_type:
-        data = {"Period_End": "2026-03-31", "YTD_Gross": "21,350.50"}
-    elif "1040" in doc_type:
-        data = {"AGI": "142,000.00", "Tax_Year": "2025"}
+    if not isinstance(ocr_text, str) or not ocr_text:
+        return data
+
+    text = ocr_text
+    
+    # Generic extraction patterns for FBR and similar certificates
+    patterns = {
+        "Registration No.": r"(?i)Registration\s*No\.?[\s:]*([A-Z0-9-]+)",
+        "Date of Registration": r"(?i)Date\s*of\s*Registration[\s:]*([\d]{1,2}-[A-Za-z]{3}-[\d]{4}|[\d]{1,2}/[\d]{1,2}/[\d]{4})",
+        "Type of Person": r"(?i)Type\s*of\s*Person[\s:]*([A-Za-z\s]+?)(?=\n|Name|Address|$)",
+        "Name": r"(?i)\bName[\s:]*([A-Za-z\s\.\-]+?)(?=\n|Address|Tax Office|Type of Person|$)",
+        "Address": r"(?i)Address[\s:]*(.+?)(?=\n|Tax Office|Activity Type|$)",
+        "Tax Office": r"(?i)Tax\s*Office[\s:]*(.+?)(?=\n|Activity Type|$)",
+        "Activity Type": r"(?i)Activity\s*Type[\s:]*(.+?)(?=\n|$)"
+    }
+    
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            val = match.group(1).strip()
+            if val:
+                data[key] = val
+
+    full_text = ocr_text.upper()
+    upper_doc = doc_type.upper() if doc_type else ""
+    if "W-2" in upper_doc or "W2" in upper_doc:
+        data.update({"Employer_EIN": "12-3456789", "Box1_Wages": "85,400.00"})
+    elif "PAYSTUB" in upper_doc:
+        data.update({"Period_End": "2026-03-31", "YTD_Gross": "21,350.50"})
+    elif "1040" in upper_doc:
+        data.update({"AGI": "142,000.00", "Tax_Year": "2025"})
+        
     return data
 
 @app.post("/export")
@@ -366,7 +392,7 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
                 else:
                     ocr_reader = get_reader()
                     res = ocr_reader.readtext(image_path)
-                    ocr_text = " ".join([item[1] for item in res]) if res else ""
+                    ocr_text = "\n".join([item[1] for item in res]) if res else ""
             except:
                 ocr_text, res = "", None
 
@@ -374,7 +400,7 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
             ai_label, fuzzy_confidence = classify_page(text_blocks)
             confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
             should_flag = confidence < 0.85 or len(anomalies) > 0
-            extracted = extract_mortgage_entities(ocr_text, ai_label)
+            extracted = extract_entities(ocr_text, ai_label)
             
             page_records.append({
                 "page_index": i, "s3_path": image_filename, "ai_label": ai_label,
@@ -428,7 +454,7 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
                 else:
                     ocr_reader = get_reader()
                     res = ocr_reader.readtext(image_path)
-                    ocr_text = " ".join([item[1] for item in res]) if res else ""
+                    ocr_text = "\n".join([item[1] for item in res]) if res else ""
             except:
                 ocr_text, res = "", None
 
@@ -436,7 +462,7 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
             ai_label, fuzzy_confidence = classify_page(text_blocks)
             confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
             should_flag = confidence < 0.85 or len(anomalies) > 0
-            extracted = extract_mortgage_entities(ocr_text, ai_label)
+            extracted = extract_entities(ocr_text, ai_label)
 
             page_records.append({
                 "page_index": abs_index,
