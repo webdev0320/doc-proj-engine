@@ -490,4 +490,4 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8002)
