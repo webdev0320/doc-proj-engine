@@ -245,40 +245,279 @@ def scan_health_check(image_path):
     if abs(skew_angle) > 5: issues.append("SKEWED")
     return issues, fm, skew_angle
 
+def _extract_field(text, pattern, default=None, multiline=False):
+    """Helper: extract a single captured group from text using regex."""
+    flags = re.IGNORECASE | (re.DOTALL if multiline else 0)
+    m = re.search(pattern, text, flags)
+    if m:
+        val = m.group(1).strip()
+        # Clean up common OCR noise - extra whitespace, leading colons
+        val = re.sub(r'\s+', ' ', val).strip(':').strip()
+        return val if val else default
+    return default
+
+# Labels that bound GFE field values — stop extracting when we see one of these
+_GFE_LABELS = (
+    r"(?:Name\s+of\s+Originator|Borrower|Originator\s+Address|Property\s+Address|"
+    r"Originator\s+Phone|Originator\s+Email|Date\s+of\s+GFE|Purpose|Loan\s+Terms|"
+    r"Initial\s+loan|Summary\s+of\s+your|Shopping\s+chart|Understanding)"
+)
+
+def _extract_gfe(text):
+    """Extract fields from Good Faith Estimate (GFE) document."""
+    data = {}
+    # Each field: value ends at a newline OR at the next known GFE label
+    boundary = r"(?=\n" + _GFE_LABELS + r"|$)"
+    fields = {
+        "Name of Originator": r"Name\s+of\s+Originator\s*\n([^\n]+)" + boundary,
+        "Borrower":           r"\bBorrower\b\s*\n([^\n]+)" + boundary,
+        "Originator Address": r"Originator\s+Address\s*\n([^\n]+)" + boundary,
+        "Property Address":   r"Property\s+Address\s*\n([^\n]+)" + boundary,
+        "Originator Phone Number": r"Originator\s+Phone\s*(?:Number)?\s*\n([^\n]+)",
+        "Originator Email":   r"Originator\s+Email\s*\n([^\n]+)",
+        "Date of GFE":        r"Date\s+of\s+GFE\s*\n([^\n]+)",
+        "Loan Amount":        r"Initial\s+loan\s+amount\s+\$\s*([\d,\.]+)",
+        "Interest Rate":      r"Initial\s+interest\s+rate\s+([\d\.]+\s*%)",
+        "Loan Term":          r"Loan\s+[Tt]erm\s+([\d]+\s+(?:years?|months?))",
+        "Loan Purpose":       r"Loan\s+Purpose\s+([^\n]+)",
+        "Property Value":     r"(?:Purchase\s+price|estimated\s+to\s+be\s+worth)\s+\$\s*([\d,\.]+)",
+        "Settlement Charges": r"Total\s+Settlement\s+Charges\s+\$\s*([\d,\.]+)",
+        "Our Origination Charge": r"Our\s+origination\s+charge\s+\$\s*([\d,\.]+)",
+        "Can Interest Rate Rise": r"Can\s+your\s+interest\s+rate\s+rise\?\s*([^\n]+)",
+        "Can Loan Balance Rise":  r"Can\s+your\s+loan\s+balance\s+rise\?\s*([^\n]+)",
+        "Can Monthly Amount Rise": r"Can\s+your\s+monthly\s+amount\s+owed\s+rise\?\s*([^\n]+)",
+    }
+    for key, pattern in fields.items():
+        val = _extract_field(text, pattern)
+        if val:
+            data[key] = val
+    return data
+
+def _extract_urla(text):
+    """Extract fields from Uniform Residential Loan Application (URLA / 1003)."""
+    data = {}
+    fields = {
+        "Borrower Name": r"(?:Borrower's\s+Name|Borrower\s+Name)\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|Co-Borrower|Social)",
+        "Co-Borrower Name": r"Co-Borrower(?:'s)?\s+Name\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|Social|Address)",
+        "Property Address": r"(?:Subject\s+Property\s+Address|Property\s+Street\s+Address)\s*:?\s*([^\n]+(?:\n[^\n]{0,60})?)",
+        "City": r"(?:City|City\s*,\s*State)\s*:?\s*([A-Za-z\s]+?)(?=,|\n|State|County|Zip)",
+        "State": r"State\s*:?\s*([A-Z]{2})\b",
+        "Zip Code": r"Zip\s*(?:Code)?\s*:?\s*(\d{5}(?:-\d{4})?)",
+        "Loan Amount": r"(?:Amount\s+of\s+Loan|Loan\s+Amount)\s*\$?\s*([\d,\.]+)",
+        "Interest Rate": r"Interest\s+Rate\s*:?\s*([\d\.]+\s*%)",
+        "Loan Term": r"(?:No\.\s*of\s*Months|Loan\s+Term)\s*:?\s*([\d]+)",
+        "Amortization Type": r"Amortization\s+Type\s*:?\s*([^\n]+)",
+        "Loan Purpose": r"Purpose\s+of\s+Loan\s*:?\s*([^\n]+)",
+        "Property Type": r"Property\s+will\s+be\s*:?\s*([^\n]+)",
+        "Social Security Number": r"(?:Social\s+Security\s+Number|SSN)\s*[:#]?\s*([\dX\*\-]{9,11})",
+        "Date of Birth": r"(?:Date\s+of\s+Birth|DOB)\s*:?\s*([\d]{1,2}[\/\-][\d]{1,2}[\/\-][\d]{2,4})",
+        "Employer Name": r"(?:Name\s+and\s+Address\s+of\s+Employer|Employer\s*Name)\s*:?\s*([^\n]+)",
+        "Monthly Income": r"(?:Base\s+Empl\.\s+Income|Monthly\s+Income)\s*\$?\s*([\d,\.]+)",
+    }
+    for key, pattern in fields.items():
+        val = _extract_field(text, pattern)
+        if val:
+            data[key] = val
+    return data
+
+def _extract_tia(text):
+    """Extract fields from Tax Information Authorization (TIA / IRS Form 8821 / 4506)."""
+    data = {}
+    fields = {
+        "Taxpayer Name": r"(?:Taxpayer\s+name\(s\)|1\.\s+Taxpayer\s+information)\s*:?\s*([^\n]+)",
+        "Taxpayer Identification Number": r"(?:Taxpayer\s+identification\s+number|TIN|SSN)\s*:?\s*([\dX\*\-]{7,11})",
+        "Current Address": r"(?:Current\s+address|Street\s+address)\s*:?\s*([^\n]+)",
+        "City State Zip": r"(?:City\s+or\s+town,\s+state|City,\s+state)\s*:?\s*([^\n]+)",
+        "Appointee Name": r"(?:2\.\s+Appointee|Appointee\s*'?s?\s+name)\s*:?\s*([^\n]+)",
+        "Appointee Address": r"(?:Appointee\s+address|CAF\s+No)\s*:?\s*([^\n]+)",
+        "Tax Form Number": r"(?:Tax\s+[Ff]orm\s+[Nn]umber|Form\s+number)\s*:?\s*([^\n]+)",
+        "Year or Period": r"(?:Year\(s\)\s+or\s+period\(s\)|Tax\s+year|Tax\s+period)\s*:?\s*([^\n]+)",
+        "Specific Use": r"(?:4\.\s+Specific\s+use|Specific\s+use\s+not\s+recorded)\s*:?\s*([^\n]+)",
+        "Signature Date": r"Signature\s*:?\s*Date\s*:?\s*([\d\/\-\.]+)",
+    }
+    for key, pattern in fields.items():
+        val = _extract_field(text, pattern)
+        if val:
+            data[key] = val
+    return data
+
+def _extract_ls(text):
+    """Extract fields from Loan Submission Sheet (LS)."""
+    data = {}
+    fields = {
+        "Submitting Company": r"(?:Submitting\s+Broker[\/\-]?Lender|Company)\s*\n([^\n]+)",
+        "Broker/Lender Address": r"(?:Submitting\s+Broker[\/\-]?Lender|Company)\s*\n[^\n]+\n(?:Address)\s*\n([^\n]+)",
+        "Processor": r"Processor\s*\n([^\n]+)",
+        "Phone Number": r"Phone\s*#\s*\n([^\n]+)",
+        "Fax Number": r"Fax\s*#\s*\n([^\n]+)",
+        "Estimated Close of Escrow": r"Estimated\s+Close\s+of\s+Escrow\s*\n([^\n]+)",
+        "Borrower": r"Borrower\s*\n([^\n]+)",
+        "Co-Borrower": r"Co-Borrower\s*\n([^\n]+)",
+        "Property Address": r"Property\s+Address\s*\n([^\n]+)",
+        "Program": r"Program\s*\n([^\n]+)",
+        "Property Type": r"Property\s+Type\s*\n([^\n]+)",
+        "Loan Amount": r"Loan\s+Amount\s*\$?\s*([\d,\.]+)",
+        "Sales Price": r"Sales\s+Price\s*\$?\s*([\d,\.]+)",
+        "Interest Rate": r"Interest\s+Rate\s*:?\s*([\d\.]+\s*%?)",
+        "LTV": r"\bLTV\b\s*:?\s*([\d\.]+\s*%?)",
+        "Amortization": r"Amortization\s*:?\s*([\d]+)",
+        "Rate Lock": r"Rate\s+Lock\s*:?\s*([^\n]+)",
+        "Origination Fee": r"Origination\s+Fee\s*[%\$]?\s*([^\n]+)",
+        "Appraisal Fee": r"Appraisal\s+Fee\s*:?\s*\$?\s*([\d,\.]+)",
+        "Escrow Company": r"Escrow\s+Company[\/\-]?Attorney\s*\nCompany\s*\n([^\n]+)",
+        "Title Company": r"Title\s+Company\s*\nCompany\s*\n([^\n]+)",
+        "Appraiser": r"Appraiser\s*\n([^\n]+)",
+    }
+    for key, pattern in fields.items():
+        val = _extract_field(text, pattern)
+        if val:
+            data[key] = val
+    return data
+
+def _extract_all_labels_values(ocr_text):
+    """
+    Universal sweep: extract ALL label/value pairs from OCR text.
+    Detects two common patterns in scanned forms:
+      1. "Label: Value" on the same line
+      2. "Label\nValue" where the label is on one line and value on the next
+    Skips noise lines (too short, all-caps boilerplate, page numbers, etc.)
+    """
+    data = {}
+    if not ocr_text:
+        return data
+
+    lines = ocr_text.split('\n')
+
+    # Noise filters
+    _SKIP_WORDS = {
+        '', 'page', 'of', 'yes', 'no', 'true', 'false', 'n/a', 'none',
+        'the', 'a', 'an', 'and', 'or', 'for', 'to', 'in', 'on', 'at',
+        'is', 'are', 'was', 'were', 'be', 'been', 'being', 'if', 'not',
+    }
+
+    def _is_noise(s):
+        """Check if a string is noise (too short, just numbers, common word)."""
+        s = s.strip()
+        if not s or len(s) < 2 or len(s) > 80:
+            return True
+        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s):
+            return True
+        if s.lower().strip(':').strip() in _SKIP_WORDS:
+            return True
+        # Skip long paragraph-like text
+        if len(s) > 60 and s.count(' ') > 10:
+            return True
+        return False
+
+    def _looks_like_label(s):
+        """Check if a line looks like a form field label (short, Title/UPPER case, no $)."""
+        s = s.strip()
+        if not s or len(s) < 2 or len(s) > 50:
+            return False
+        if '$' in s or '%' in s:
+            return False
+        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s):
+            return False
+        if s[0].isupper() and s.count(' ') <= 6:
+            return True
+        return False
+
+    def _clean_label(s):
+        """Normalize a label string."""
+        s = s.strip().rstrip(':').strip()
+        return s
+
+    # Pattern 1: "Label: Value" or "Label   Value" on the same line
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Match "Label: Value"
+        m1 = re.match(r'^([A-Za-z][A-Za-z\s\.\-\/\(\)#]{1,50}):\s+(.+)$', line)
+        if m1:
+            label = _clean_label(m1.group(1))
+            value = m1.group(2).strip()
+            if not _is_noise(label) and value and label not in data:
+                data[label] = value
+            continue
+            
+        # Match "Label   Value" (separated by 2 or more spaces/tabs)
+        m2 = re.match(r'^([A-Za-z][A-Za-z\s\.\-\/\(\)#]{1,50})(?:\s{2,}|\t+)(.+)$', line)
+        if m2 and not ':' in line: # avoid clashing with Pattern 1
+            label = _clean_label(m2.group(1))
+            value = m2.group(2).strip()
+            if _looks_like_label(label) and not _is_noise(label) and value and label not in data:
+                data[label] = value
+
+    # Pattern 2: "Label\nValue" — label on one line, value on the next
+    for i in range(len(lines) - 1):
+        label_line = lines[i].strip()
+        value_line = lines[i + 1].strip()
+
+        if not label_line or not value_line:
+            continue
+
+        # Label must look like a form field name
+        if not _looks_like_label(label_line):
+            continue
+
+        # If it has a colon, it must be at the end.
+        if ':' in label_line and not label_line.endswith(':'):
+            continue
+
+        # Avoid chaining (e.g., "Name of Originator\nBorrower\nJohn Doe")
+        # If value_line also looks like a label, check if it's acting as a label for the NEXT line
+        if _looks_like_label(value_line) and not re.search(r'[\d@\$%#\(\)]', value_line):
+            is_definite_label = label_line.endswith(':')
+            if not is_definite_label:
+                # Look ahead to see if value_line is actually a label for lines[i+2]
+                if i + 2 < len(lines):
+                    next_val = lines[i + 2].strip()
+                    if next_val and not _looks_like_label(next_val):
+                        # value_line is acting as a label for next_val
+                        continue
+                else:
+                    # End of file, ambiguous but likely not chaining
+                    pass
+
+        label = _clean_label(label_line)
+        if not _is_noise(label) and value_line and label not in data:
+            data[label] = value_line
+
+    return data
+
+
 def extract_entities(ocr_text, doc_type):
+    """Extract structured fields from OCR text based on the document type.
+    
+    Uses two strategies:
+    1. Document-type-specific regex patterns for high-priority known fields
+    2. Universal label/value sweep to capture ALL remaining fields
+    """
     data = {}
     if not isinstance(ocr_text, str) or not ocr_text:
         return data
 
-    text = ocr_text
-    
-    # Generic extraction patterns for FBR and similar certificates
-    patterns = {
-        "Registration No.": r"(?i)Registration\s*No\.?[\s:]*([A-Z0-9-]+)",
-        "Date of Registration": r"(?i)Date\s*of\s*Registration[\s:]*([\d]{1,2}-[A-Za-z]{3}-[\d]{4}|[\d]{1,2}/[\d]{1,2}/[\d]{4})",
-        "Type of Person": r"(?i)Type\s*of\s*Person[\s:]*([A-Za-z\s]+?)(?=\n|Name|Address|$)",
-        "Name": r"(?i)\bName[\s:]*([A-Za-z\s\.\-]+?)(?=\n|Address|Tax Office|Type of Person|$)",
-        "Address": r"(?i)Address[\s:]*(.+?)(?=\n|Tax Office|Activity Type|$)",
-        "Tax Office": r"(?i)Tax\s*Office[\s:]*(.+?)(?=\n|Activity Type|$)",
-        "Activity Type": r"(?i)Activity\s*Type[\s:]*(.+?)(?=\n|$)"
-    }
-    
-    for key, pattern in patterns.items():
-        match = re.search(pattern, text)
-        if match:
-            val = match.group(1).strip()
-            if val:
-                data[key] = val
+    upper_doc = (doc_type or "").upper()
 
-    full_text = ocr_text.upper()
-    upper_doc = doc_type.upper() if doc_type else ""
-    if "W-2" in upper_doc or "W2" in upper_doc:
-        data.update({"Employer_EIN": "12-3456789", "Box1_Wages": "85,400.00"})
-    elif "PAYSTUB" in upper_doc:
-        data.update({"Period_End": "2026-03-31", "YTD_Gross": "21,350.50"})
-    elif "1040" in upper_doc:
-        data.update({"AGI": "142,000.00", "Tax_Year": "2025"})
-        
+    # Step 1: Run the universal sweep FIRST to get all label/value pairs
+    data = _extract_all_labels_values(ocr_text)
+
+    # Step 2: Run doc-type-specific extractor and MERGE (overrides universal)
+    typed_data = {}
+    if upper_doc == "GFE":
+        typed_data = _extract_gfe(ocr_text)
+    elif upper_doc == "URLA":
+        typed_data = _extract_urla(ocr_text)
+    elif upper_doc in ("TIA", "RTTR"):
+        typed_data = _extract_tia(ocr_text)
+    elif upper_doc == "LS":
+        typed_data = _extract_ls(ocr_text)
+
+    # Type-specific fields override universal ones (they are more accurate)
+    data.update(typed_data)
+
     return data
 
 @app.post("/export")
@@ -359,9 +598,16 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
              print(f"!!! [PIPELINE ERROR] File does not exist: {pdf_path}")
              return
 
-        # Skipping decryption as files are currently unencrypted
-        print(f">>> [PIPELINE] Opening PDF: {pdf_path}")
-        doc = fitz.open(pdf_path)
+        # Decrypt file before opening
+        decrypted_path = pdf_path + ".dec"
+        decrypt_file(pdf_path, decrypted_path)
+        
+        if not os.path.exists(decrypted_path) or os.path.getsize(decrypted_path) == 0:
+            print(f"!!! [PIPELINE ERROR] Decryption failed or resulted in empty file: {decrypted_path}")
+            return
+
+        print(f">>> [PIPELINE] Opening PDF: {decrypted_path}")
+        doc = fitz.open(decrypted_path)
         print(f">>> [PIPELINE] PDF opened. Pages: {len(doc)}")
         page_records = []
         for i in range(len(doc)):
@@ -409,12 +655,29 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
             })
             print(f"Page {page_num}: {ai_label} (Conf: {confidence})")
 
-        requests.post(f"{BACKEND_URL}/api/blobs/{blob_id}/pages", json={"pages": page_records})
-        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"})
+        try:
+            r = requests.post(f"{BACKEND_URL}/api/blobs/{blob_id}/pages", json={"pages": page_records}, timeout=30)
+            print(f">>> [CALLBACK] POST /api/blobs/{blob_id}/pages -> {r.status_code} {r.text}")
+        except Exception as cb_e:
+            print(f">>> [CALLBACK ERROR] Failed to POST pages to backend: {cb_e}")
+
+        try:
+            r2 = requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"}, timeout=10)
+            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code} {r2.text}")
+        except Exception as cb_e:
+            print(f">>> [CALLBACK ERROR] Failed to PATCH backend status: {cb_e}")
         doc.close()
     except Exception as e:
-        print(f"[ERROR] Pipeline failed: {e}")
-        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED"})
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[ERROR] Pipeline failed: {e}\n{tb}")
+        try:
+            requests.patch(
+                f"{BACKEND_URL}/api/blobs/{blob_id}",
+                json={"status": "FAILED", "error": str(e), "trace": tb}
+            )
+        except Exception as notify_err:
+            print(f"[ERROR] Failed to notify backend of failure: {notify_err}")
 
 def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_settings: Optional[Dict[str, Any]] = None):
     """Processes a new file and appends its pages to an existing blob, starting from page_offset."""
@@ -424,7 +687,11 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
             print(f"!!! [APPEND ERROR] File does not exist: {pdf_path}")
             return
 
-        doc = fitz.open(pdf_path)
+        # Decrypt file before opening
+        decrypted_path = pdf_path + ".dec"
+        decrypt_file(pdf_path, decrypted_path)
+
+        doc = fitz.open(decrypted_path)
         print(f">>> [APPEND] PDF opened. New pages: {len(doc)}")
         page_records = []
 
@@ -476,16 +743,34 @@ def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_s
             print(f"[APPEND] Page {abs_index}: {ai_label} (Conf: {confidence})")
 
         # Post back with mode=append so existing pages are NOT deleted
-        requests.post(
-            f"{BACKEND_URL}/api/blobs/{blob_id}/pages",
-            json={"pages": page_records, "mode": "append"}
-        )
-        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"})
+        try:
+            r = requests.post(
+                f"{BACKEND_URL}/api/blobs/{blob_id}/pages",
+                json={"pages": page_records, "mode": "append"},
+                timeout=30
+            )
+            print(f">>> [CALLBACK] POST /api/blobs/{blob_id}/pages (append) -> {r.status_code} {r.text}")
+        except Exception as cb_e:
+            print(f">>> [CALLBACK ERROR] Failed to POST append pages to backend: {cb_e}")
+
+        try:
+            r2 = requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"}, timeout=10)
+            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code} {r2.text}")
+        except Exception as cb_e:
+            print(f">>> [CALLBACK ERROR] Failed to PATCH backend status: {cb_e}")
         doc.close()
         print(f">>> [APPEND] Done. Added {len(page_records)} pages to blob {blob_id}")
     except Exception as e:
-        print(f"[APPEND ERROR] Pipeline failed: {e}")
-        requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED"})
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[APPEND ERROR] Pipeline failed: {e}\n{tb}")
+        try:
+            requests.patch(
+                f"{BACKEND_URL}/api/blobs/{blob_id}",
+                json={"status": "FAILED", "error": str(e), "trace": tb}
+            )
+        except Exception as notify_err:
+            print(f"[APPEND ERROR] Failed to notify backend of failure: {notify_err}")
 
 
 if __name__ == "__main__":
