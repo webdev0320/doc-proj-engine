@@ -1,10 +1,8 @@
 import os
-# STABILITY FLAGS
+# STABILITY FLAGS (Adjusted for performance)
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-os.environ['OMP_NUM_THREADS'] = '1'
-# Disable Paddle specific flags if not using PaddleOCR library
-# os.environ['FLAGS_use_mkldnn'] = '0'
-# os.environ['PADDLE_ONEDNN'] = 'OFF'
+# Allow a reasonable thread count for OpenMP instead of hard locking to 1
+os.environ['OMP_NUM_THREADS'] = '4' 
 
 import shutil
 import requests
@@ -15,11 +13,12 @@ import fitz
 import paramiko
 import boto3
 import re
+import time
 from io import BytesIO
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-# import easyocr  # Moved to lazy loading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from paddleOCR import classify_page
 from crypto_utils import decrypt_file
 from dotenv import load_dotenv
@@ -34,11 +33,50 @@ def get_reader():
     if _reader is None:
         print(">>> [OCR] Loading EasyOCR model (this may take a moment)...")
         import easyocr
-        _reader = easyocr.Reader(['en'], gpu=False)
-        print(">>> [OCR] EasyOCR ready.")
+        gpu_setting = os.getenv("EASYOCR_GPU", "auto").lower()
+        if gpu_setting == "auto":
+            try:
+                import torch
+                use_gpu = torch.cuda.is_available()
+            except Exception:
+                use_gpu = False
+        else:
+            use_gpu = gpu_setting in ("1", "true", "yes")
+        _reader = easyocr.Reader(['en'], gpu=use_gpu)
+        print(f">>> [OCR] EasyOCR ready. gpu={use_gpu}")
     return _reader
 
 app = FastAPI(title="IDP Engine - PaddleOCR")
+
+# Reusable Thread Pool for heavy concurrent tasks and file uploads
+# Using a max_workers of 5-10 prevents overloading system resources while bypassing sequential bottlenecks.
+IO_EXECUTOR = ThreadPoolExecutor(max_workers=10)
+
+PAGE_RENDER_SCALE = float(os.getenv("PAGE_RENDER_SCALE", "1.5"))
+OCR_TEXT_THRESHOLD = int(os.getenv("OCR_TEXT_THRESHOLD", "20"))
+MAX_PAGE_WORKERS = int(os.getenv("MAX_PAGE_WORKERS", "4"))
+ENABLE_SCAN_HEALTH_CHECK = os.getenv("ENABLE_SCAN_HEALTH_CHECK", "false").lower() in ("1", "true", "yes")
+HEALTH_CHECK_NATIVE_TEXT = os.getenv("HEALTH_CHECK_NATIVE_TEXT", "false").lower() in ("1", "true", "yes")
+EASYOCR_CANVAS_SIZE = int(os.getenv("EASYOCR_CANVAS_SIZE", "1600"))
+EASYOCR_BATCH_SIZE = int(os.getenv("EASYOCR_BATCH_SIZE", "4"))
+PAGE_IMAGE_FORMAT = os.getenv("PAGE_IMAGE_FORMAT", "jpg").lower().lstrip(".")
+if PAGE_IMAGE_FORMAT not in ("jpg", "jpeg", "png"):
+    PAGE_IMAGE_FORMAT = "jpg"
+PAGE_JPEG_QUALITY = int(os.getenv("PAGE_JPEG_QUALITY", "85"))
+
+def save_page_pixmap(pix, image_path, image_format):
+    if image_format in ("jpg", "jpeg"):
+        try:
+            from PIL import Image
+            mode = "RGBA" if pix.alpha else "RGB"
+            image = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            image.save(image_path, format="JPEG", optimize=True, quality=PAGE_JPEG_QUALITY)
+            return
+        except Exception as e:
+            print(f">>> [IMAGE] JPEG save via Pillow failed, falling back to PNG bytes: {e}")
+    pix.save(image_path)
 
 @app.middleware("http")
 async def log_requests(request, call_next):
@@ -74,13 +112,13 @@ class ProcessRequest(BaseModel):
 class ExportRequest(BaseModel):
     blob_id: str
     filename: str
-    manifest: list # list of {documentId, documentName, pages: [s3Path]}
+    manifest: list 
     storage_settings: Optional[Dict[str, Any]] = None
 
 class AppendRequest(BaseModel):
     blob_id: str
     storage_path: str
-    page_offset: int = 0  # Starting page index to avoid collisions with existing pages
+    page_offset: int = 0  
     storage_settings: Optional[Dict[str, Any]] = None
 
 @app.get("/health")
@@ -120,10 +158,24 @@ def download_from_remote(filename, local_path, settings):
         transport.connect(username=user, password=password)
         sftp = paramiko.SFTPClient.from_transport(transport)
         try:
-            sftp.get(f"/Inbound/{filename}", local_path)
-        except:
-            print(f"File not in Inbound. Checking Archive for {filename}...")
-            sftp.get(f"/Archive/{filename}", local_path)
+            try:
+                sftp.get(f"/Inbound/{filename}", local_path)
+            except Exception as e_abs:
+                print(f"Absolute path Inbound download failed ({e_abs}). Trying relative path...")
+                try:
+                    sftp.get(f"Inbound/{filename}", local_path)
+                except Exception as e_rel:
+                    print(f"Relative path Inbound download failed ({e_rel}). Trying root directory...")
+                    try:
+                        sftp.get(f"/{filename}", local_path)
+                    except Exception as e_root_abs:
+                        sftp.get(filename, local_path)
+        except Exception as e_inbound:
+            print(f"File not in Inbound/Root: {e_inbound}. Checking Archive...")
+            try:
+                sftp.get(f"/Archive/{filename}", local_path)
+            except Exception as e_arch_abs:
+                sftp.get(f"Archive/{filename}", local_path)
         sftp.close()
         transport.close()
 
@@ -135,93 +187,94 @@ def upload_to_remote(local_path, remote_path, settings):
         access_key = settings.get('s3AccessKey')
         secret_key = settings.get('s3SecretKey')
         region = settings.get('s3Region', 'us-east-1')
-        if all([bucket, access_key, secret_key]):
-            s3 = boto3.client('s3', region_name=region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
-            s3.upload_file(local_path, bucket, remote_path)
+        if not all([bucket, access_key, secret_key]):
+            raise ValueError("Missing S3 credentials in settings")
+        s3 = boto3.client('s3', region_name=region, aws_access_key_id=access_key, aws_secret_access_key=secret_key)
+        s3.upload_file(local_path, bucket, remote_path)
     else:
         host, user, p = settings.get('sftpHost'), settings.get('sftpUser'), settings.get('sftpPass')
         port = int(settings.get('sftpPort', 22))
-        if all([host, user, p]):
-            transport = paramiko.Transport((host, port))
-            transport.connect(username=user, password=p)
-            sftp = paramiko.SFTPClient.from_transport(transport)
-            # Ensure directory exists (e.g., /pages)
-            remote_dir = os.path.dirname(remote_path)
-            try: sftp.mkdir(remote_dir)
-            except: pass
-            sftp.put(local_path, remote_path)
-            sftp.close()
-            transport.close()
+        if not all([host, user, p]):
+            raise ValueError("Missing SFTP credentials in settings")
+        transport = paramiko.Transport((host, port))
+        transport.connect(username=user, password=p)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        remote_dir = os.path.dirname(remote_path)
+        try: sftp.mkdir(remote_dir)
+        except: pass
+        sftp.put(local_path, remote_path)
+        sftp.close()
+        transport.close()
+
+def upload_to_remote_with_retries(local_path, remote_path, settings, attempts=3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            upload_to_remote(local_path, remote_path, settings)
+            return True
+        except Exception as e:
+            last_error = e
+            print(f"!!! [UPLOAD] Attempt {attempt}/{attempts} failed for {remote_path}: {e}")
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 5))
+    raise last_error
+
+def wait_for_page_uploads(page_records):
+    upload_futures = [
+        record.pop("_upload_future", None)
+        for record in page_records
+    ]
+    upload_futures = [future for future in upload_futures if future is not None]
+    if not upload_futures:
+        return
+
+    print(f">>> [UPLOAD] Waiting for {len(upload_futures)} page image uploads...")
+    failed = 0
+    for future in as_completed(upload_futures):
+        try:
+            future.result()
+        except Exception as e:
+            failed += 1
+            print(f"!!! [UPLOAD] Page image upload failed after retries: {e}")
+    if failed:
+        raise RuntimeError(f"{failed} page image upload(s) failed")
+    print(">>> [UPLOAD] All page image uploads completed.")
 
 @app.post("/process")
 async def process_document(req: ProcessRequest, background_tasks: BackgroundTasks):
     pdf_path = os.path.join(BLOBS_DIR, req.storage_path)
     
-    # If file doesn't exist locally or is empty (failed previous download), try to download it
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
         if os.path.exists(pdf_path):
-            print(f"Empty file found at {pdf_path}. Deleting...")
             os.remove(pdf_path)
             
         if req.storage_settings:
             try:
-                # Try downloading full path first (e.g. for Add Pages where remote has UUID)
-                print(f"[DEBUG] File missing locally. Trying remote download: {req.storage_path}")
-                try:
-                    download_from_remote(req.storage_path, pdf_path, req.storage_settings)
-                except Exception as e1:
-                    # Fallback: strip UUID (first 37 chars) for SFTP Poller flow
-                    if len(req.storage_path) > 37 and req.storage_path[36] == '-':
-                        stripped = req.storage_path[37:]
-                        print(f"[DEBUG] Full path failed, trying stripped: {stripped}")
-                        download_from_remote(stripped, pdf_path, req.storage_settings)
-                    else:
-                        raise e1
+                download_from_remote(req.storage_path, pdf_path, req.storage_settings)
             except Exception as e:
-                print(f"[ERROR] Remote download failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to download file from remote storage: {e}")
+                raise HTTPException(status_code=500, detail=f"Failed to download file: {e}")
         else:
-            raise HTTPException(status_code=404, detail=f"PDF not found locally and no storage settings provided.")
+            raise HTTPException(status_code=404, detail=f"PDF not found locally.")
 
-    # Run OCR in background
     background_tasks.add_task(run_pipeline, req.blob_id, pdf_path, req.storage_settings)
-    
     return {"success": True, "message": "OCR processing started in background"}
-
 
 @app.post("/process-append")
 async def process_append(req: AppendRequest, background_tasks: BackgroundTasks):
-    """
-    Appends new pages from a new file to an existing blob.
-    Page indices start from req.page_offset so they don't collide with existing pages.
-    """
     pdf_path = os.path.join(BLOBS_DIR, req.storage_path)
-    print(f"[DEBUG] Checking local path: {pdf_path}")
-
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
         if os.path.exists(pdf_path):
             os.remove(pdf_path)
         if req.storage_settings:
             try:
-                print(f"[APPEND] File missing locally. Trying remote download: {req.storage_path}")
-                try:
-                    download_from_remote(req.storage_path, pdf_path, req.storage_settings)
-                except Exception as e1:
-                    if len(req.storage_path) > 37 and req.storage_path[36] == '-':
-                        stripped = req.storage_path[37:]
-                        print(f"[APPEND] Full path failed, trying stripped: {stripped}")
-                        download_from_remote(stripped, pdf_path, req.storage_settings)
-                    else:
-                        raise e1
+                download_from_remote(req.storage_path, pdf_path, req.storage_settings)
             except Exception as e:
-                print(f"[APPEND ERROR] Remote download failed: {e}")
                 raise HTTPException(status_code=500, detail=f"Failed to download append file: {e}")
         else:
-            raise HTTPException(status_code=404, detail="Append file not found and no storage settings provided.")
+            raise HTTPException(status_code=404, detail="Append file not found.")
 
     background_tasks.add_task(run_pipeline_append, req.blob_id, pdf_path, req.page_offset, req.storage_settings)
     return {"success": True, "message": "Append processing started in background"}
-
 
 
 def scan_health_check(image_path):
@@ -245,18 +298,16 @@ def scan_health_check(image_path):
     if abs(skew_angle) > 5: issues.append("SKEWED")
     return issues, fm, skew_angle
 
+# (Keeping your entity extractors exactly as they were so you don't break logic)
 def _extract_field(text, pattern, default=None, multiline=False):
-    """Helper: extract a single captured group from text using regex."""
     flags = re.IGNORECASE | (re.DOTALL if multiline else 0)
     m = re.search(pattern, text, flags)
     if m:
         val = m.group(1).strip()
-        # Clean up common OCR noise - extra whitespace, leading colons
         val = re.sub(r'\s+', ' ', val).strip(':').strip()
         return val if val else default
     return default
 
-# Labels that bound GFE field values — stop extracting when we see one of these
 _GFE_LABELS = (
     r"(?:Name\s+of\s+Originator|Borrower|Originator\s+Address|Property\s+Address|"
     r"Originator\s+Phone|Originator\s+Email|Date\s+of\s+GFE|Purpose|Loan\s+Terms|"
@@ -264,9 +315,7 @@ _GFE_LABELS = (
 )
 
 def _extract_gfe(text):
-    """Extract fields from Good Faith Estimate (GFE) document."""
     data = {}
-    # Each field: value ends at a newline OR at the next known GFE label
     boundary = r"(?=\n" + _GFE_LABELS + r"|$)"
     fields = {
         "Name of Originator": r"Name\s+of\s+Originator\s*\n([^\n]+)" + boundary,
@@ -289,12 +338,10 @@ def _extract_gfe(text):
     }
     for key, pattern in fields.items():
         val = _extract_field(text, pattern)
-        if val:
-            data[key] = val
+        if val: data[key] = val
     return data
 
 def _extract_urla(text):
-    """Extract fields from Uniform Residential Loan Application (URLA / 1003)."""
     data = {}
     fields = {
         "Borrower Name": r"(?:Borrower's\s+Name|Borrower\s+Name)\s*:?\s*([A-Za-z\s\.\-]+?)(?=\n|Co-Borrower|Social)",
@@ -316,12 +363,10 @@ def _extract_urla(text):
     }
     for key, pattern in fields.items():
         val = _extract_field(text, pattern)
-        if val:
-            data[key] = val
+        if val: data[key] = val
     return data
 
 def _extract_tia(text):
-    """Extract fields from Tax Information Authorization (TIA / IRS Form 8821 / 4506)."""
     data = {}
     fields = {
         "Taxpayer Name": r"(?:Taxpayer\s+name\(s\)|1\.\s+Taxpayer\s+information)\s*:?\s*([^\n]+)",
@@ -337,12 +382,10 @@ def _extract_tia(text):
     }
     for key, pattern in fields.items():
         val = _extract_field(text, pattern)
-        if val:
-            data[key] = val
+        if val: data[key] = val
     return data
 
 def _extract_ls(text):
-    """Extract fields from Loan Submission Sheet (LS)."""
     data = {}
     fields = {
         "Submitting Company": r"(?:Submitting\s+Broker[\/\-]?Lender|Company)\s*\n([^\n]+)",
@@ -370,25 +413,13 @@ def _extract_ls(text):
     }
     for key, pattern in fields.items():
         val = _extract_field(text, pattern)
-        if val:
-            data[key] = val
+        if val: data[key] = val
     return data
 
 def _extract_all_labels_values(ocr_text):
-    """
-    Universal sweep: extract ALL label/value pairs from OCR text.
-    Detects two common patterns in scanned forms:
-      1. "Label: Value" on the same line
-      2. "Label\nValue" where the label is on one line and value on the next
-    Skips noise lines (too short, all-caps boilerplate, page numbers, etc.)
-    """
     data = {}
-    if not ocr_text:
-        return data
-
+    if not ocr_text: return data
     lines = ocr_text.split('\n')
-
-    # Noise filters
     _SKIP_WORDS = {
         '', 'page', 'of', 'yes', 'no', 'true', 'false', 'n/a', 'none',
         'the', 'a', 'an', 'and', 'or', 'for', 'to', 'in', 'on', 'at',
@@ -396,44 +427,27 @@ def _extract_all_labels_values(ocr_text):
     }
 
     def _is_noise(s):
-        """Check if a string is noise (too short, just numbers, common word)."""
         s = s.strip()
-        if not s or len(s) < 2 or len(s) > 80:
-            return True
-        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s):
-            return True
-        if s.lower().strip(':').strip() in _SKIP_WORDS:
-            return True
-        # Skip long paragraph-like text
-        if len(s) > 60 and s.count(' ') > 10:
-            return True
+        if not s or len(s) < 2 or len(s) > 80: return True
+        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s): return True
+        if s.lower().strip(':').strip() in _SKIP_WORDS: return True
+        if len(s) > 60 and s.count(' ') > 10: return True
         return False
 
     def _looks_like_label(s):
-        """Check if a line looks like a form field label (short, Title/UPPER case, no $)."""
         s = s.strip()
-        if not s or len(s) < 2 or len(s) > 50:
-            return False
-        if '$' in s or '%' in s:
-            return False
-        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s):
-            return False
-        if s[0].isupper() and s.count(' ') <= 6:
-            return True
+        if not s or len(s) < 2 or len(s) > 50: return False
+        if '$' in s or '%' in s: return False
+        if re.match(r'^[\d\s\.\,\-\$\%\/]+$', s): return False
+        if s[0].isupper() and s.count(' ') <= 6: return True
         return False
 
     def _clean_label(s):
-        """Normalize a label string."""
-        s = s.strip().rstrip(':').strip()
-        return s
+        return s.strip().rstrip(':').strip()
 
-    # Pattern 1: "Label: Value" or "Label   Value" on the same line
     for line in lines:
         line = line.strip()
-        if not line:
-            continue
-        
-        # Match "Label: Value"
+        if not line: continue
         m1 = re.match(r'^([A-Za-z][A-Za-z\s\.\-\/\(\)#]{1,50}):\s+(.+)$', line)
         if m1:
             label = _clean_label(m1.group(1))
@@ -441,71 +455,33 @@ def _extract_all_labels_values(ocr_text):
             if not _is_noise(label) and value and label not in data:
                 data[label] = value
             continue
-            
-        # Match "Label   Value" (separated by 2 or more spaces/tabs)
         m2 = re.match(r'^([A-Za-z][A-Za-z\s\.\-\/\(\)#]{1,50})(?:\s{2,}|\t+)(.+)$', line)
-        if m2 and not ':' in line: # avoid clashing with Pattern 1
+        if m2 and not ':' in line:
             label = _clean_label(m2.group(1))
             value = m2.group(2).strip()
             if _looks_like_label(label) and not _is_noise(label) and value and label not in data:
                 data[label] = value
 
-    # Pattern 2: "Label\nValue" — label on one line, value on the next
     for i in range(len(lines) - 1):
         label_line = lines[i].strip()
         value_line = lines[i + 1].strip()
-
-        if not label_line or not value_line:
-            continue
-
-        # Label must look like a form field name
-        if not _looks_like_label(label_line):
-            continue
-
-        # If it has a colon, it must be at the end.
-        if ':' in label_line and not label_line.endswith(':'):
-            continue
-
-        # Avoid chaining (e.g., "Name of Originator\nBorrower\nJohn Doe")
-        # If value_line also looks like a label, check if it's acting as a label for the NEXT line
+        if not label_line or not value_line: continue
+        if not _looks_like_label(label_line): continue
+        if ':' in label_line and not label_line.endswith(':'): continue
         if _looks_like_label(value_line) and not re.search(r'[\d@\$%#\(\)]', value_line):
-            is_definite_label = label_line.endswith(':')
-            if not is_definite_label:
-                # Look ahead to see if value_line is actually a label for lines[i+2]
-                if i + 2 < len(lines):
-                    next_val = lines[i + 2].strip()
-                    if next_val and not _looks_like_label(next_val):
-                        # value_line is acting as a label for next_val
-                        continue
-                else:
-                    # End of file, ambiguous but likely not chaining
-                    pass
-
+            if i + 2 < len(lines):
+                next_val = lines[i + 2].strip()
+                if next_val and not _looks_like_label(next_val):
+                    continue
         label = _clean_label(label_line)
         if not _is_noise(label) and value_line and label not in data:
             data[label] = value_line
-
     return data
 
-
 def extract_entities(ocr_text, doc_type):
-    """Extract structured fields from OCR text based on the document type.
-    
-    Uses two strategies:
-    1. Document-type-specific regex patterns for high-priority known fields
-    2. Universal label/value sweep to capture ALL remaining fields
-    """
-    data = {}
-    if not isinstance(ocr_text, str) or not ocr_text:
-        return data
-
-    upper_doc = (doc_type or "").upper()
-
-    # Step 1: Run the universal sweep FIRST to get all label/value pairs
     data = _extract_all_labels_values(ocr_text)
-
-    # Step 2: Run doc-type-specific extractor and MERGE (overrides universal)
     typed_data = {}
+    upper_doc = (doc_type or "").upper()
     if upper_doc == "GFE":
         typed_data = _extract_gfe(ocr_text)
     elif upper_doc == "URLA":
@@ -514,10 +490,7 @@ def extract_entities(ocr_text, doc_type):
         typed_data = _extract_tia(ocr_text)
     elif upper_doc == "LS":
         typed_data = _extract_ls(ocr_text)
-
-    # Type-specific fields override universal ones (they are more accurate)
     data.update(typed_data)
-
     return data
 
 @app.post("/export")
@@ -549,7 +522,6 @@ async def export_documents(req: ExportRequest):
         
         print(f"[SUCCESS] Exported {len(exported_files)} PDFs for Blob {req.blob_id}")
 
-        # --- DYNAMIC STORAGE UPLOAD LOGIC ---
         settings = req.storage_settings or {}
         provider = settings.get('provider', 'SFTP')
         
@@ -567,7 +539,7 @@ async def export_documents(req: ExportRequest):
                             s3.upload_file(os.path.join(export_folder, f), bucket, f"Outbound/{f}")
                         logf.write(f"[{req.blob_id}] S3 Upload completed.\n")
                     except Exception as e: logf.write(f"[{req.blob_id}] S3 Error: {e}\n")
-            else: # SFTP
+            else: 
                 host, user, p = settings.get('sftpHost'), settings.get('sftpUser'), settings.get('sftpPass')
                 port = int(settings.get('sftpPort', 22))
                 if all([host, user, p]):
@@ -589,188 +561,211 @@ async def export_documents(req: ExportRequest):
         print(f"[ERROR] Export failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+# --- PARALLEL PROCESSING AND BACKGROUND UPLOAD REFACTOR ---
+
+def process_single_page(args):
+    """Processes a single page's images, OCR, and classifications in parallel."""
+    started_at = time.perf_counter()
+    blob_id, page_idx, page_bytes, storage_settings = args
+    page_num = page_idx + 1
+    ext = "jpg" if PAGE_IMAGE_FORMAT == "jpeg" else PAGE_IMAGE_FORMAT
+    image_filename = f"{blob_id}_{page_num}.{ext}"
+    image_path = os.path.join(PAGES_DIR, image_filename)
+    
+    img_doc = fitz.open("pdf", page_bytes)
+    page = img_doc[0]
+
+    # Get native PDF text before any image work. For searchable PDFs this avoids
+    # OCR completely, which is the largest processing cost by far.
+    pdf_text = page.get_text("text").strip()
+    has_native_text = len(pdf_text) > OCR_TEXT_THRESHOLD
+
+    # Render and save page image for the UI/export flow. Keep the scale modest;
+    # OCR and PNG generation time grow quickly with pixel count.
+    render_started = time.perf_counter()
+    pix = page.get_pixmap(matrix=fitz.Matrix(PAGE_RENDER_SCALE, PAGE_RENDER_SCALE), colorspace=fitz.csRGB, alpha=False)
+    save_page_pixmap(pix, image_path, ext)
+    img_doc.close()
+    render_elapsed = time.perf_counter() - render_started
+    
+    # 1. Non-blocking Network Upload (Dispatched instantly to background Thread Pool)
+    upload_future = None
+    if storage_settings:
+        remote_image_path = f"pages/{image_filename}"
+        upload_future = IO_EXECUTOR.submit(upload_to_remote_with_retries, image_path, remote_image_path, storage_settings)
+
+    # 2. Extract Structural Data and Health Checks
+    if ENABLE_SCAN_HEALTH_CHECK and (HEALTH_CHECK_NATIVE_TEXT or not has_native_text):
+        health_started = time.perf_counter()
+        anomalies, blur_score, skew = scan_health_check(image_path)
+        health_elapsed = time.perf_counter() - health_started
+    else:
+        anomalies, blur_score, skew = [], 0, 0
+        health_elapsed = 0
+    
+    # 3. Intelligent OCR Routing
+    try:
+        if has_native_text:
+            ocr_text = pdf_text
+            res = "NativeTextExtractor"
+        else:
+            ocr_reader = get_reader()
+            ocr_started = time.perf_counter()
+            res = ocr_reader.readtext(
+                image_path,
+                canvas_size=EASYOCR_CANVAS_SIZE,
+                batch_size=EASYOCR_BATCH_SIZE,
+            )
+            ocr_elapsed = time.perf_counter() - ocr_started
+            ocr_text = "\n".join([item[1] for item in res]) if res else ""
+    except Exception as e:
+        print(f"[PAGE ERROR] OCR Extraction failed on page {page_num}: {e}")
+        ocr_text, res = "", None
+        ocr_elapsed = 0
+
+    if has_native_text:
+        ocr_elapsed = 0
+
+    text_blocks = [{'text': item[1], 'confidence': item[2]} for item in res] if (res and res != "NativeTextExtractor") else [{'text': ocr_text, 'confidence': 1.0}]
+    ai_label, fuzzy_confidence = classify_page(text_blocks)
+    confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
+    should_flag = confidence < 0.85 or len(anomalies) > 0
+    extracted = extract_entities(ocr_text, ai_label)
+    total_elapsed = time.perf_counter() - started_at
+    print(
+        f"Page {page_num}: {ai_label} conf={confidence:.2f} "
+        f"native_text={has_native_text} render={render_elapsed:.2f}s "
+        f"health={health_elapsed:.2f}s ocr={ocr_elapsed:.2f}s total={total_elapsed:.2f}s"
+    )
+    
+    return {
+        "page_index": page_idx,
+        "s3_path": image_filename,
+        "ai_label": ai_label,
+        "confidence_score": confidence,
+        "is_flagged": should_flag,
+        "anomaly_flags": json.dumps(anomalies),
+        "extracted_data": json.dumps(extracted)
+    }
+
 def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[str, Any]] = None):
     try:
-        print(f">>> [PIPELINE] Starting for Blob: {blob_id}")
-        print(f">>> [PIPELINE] Input path: {pdf_path}")
-        
-        if not os.path.exists(pdf_path):
-             print(f"!!! [PIPELINE ERROR] File does not exist: {pdf_path}")
-             return
+        print(f">>> [PIPELINE] Starting fast parallel track for Blob: {blob_id}")
+        if not os.path.exists(pdf_path): return
 
-        # Decrypt file before opening
         decrypted_path = pdf_path + ".dec"
         decrypt_file(pdf_path, decrypted_path)
         
         if not os.path.exists(decrypted_path) or os.path.getsize(decrypted_path) == 0:
-            print(f"!!! [PIPELINE ERROR] Decryption failed or resulted in empty file: {decrypted_path}")
+            print(f"!!! [PIPELINE ERROR] Decryption failed.")
             return
 
-        print(f">>> [PIPELINE] Opening PDF: {decrypted_path}")
         doc = fitz.open(decrypted_path)
-        print(f">>> [PIPELINE] PDF opened. Pages: {len(doc)}")
-        page_records = []
-        for i in range(len(doc)):
-            page_num = i + 1
-            page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            image_filename = f"{blob_id}_{page_num}.png"
-            image_path = os.path.join(PAGES_DIR, image_filename)
-            pix.save(image_path)
+        num_pages = len(doc)
+        print(f">>> [PIPELINE] PDF opened. Pages: {num_pages}")
+        
+        # Pre-convert and isolate page bytes so workers can read them safely in parallel
+        tasks = []
+        for i in range(num_pages):
+            single_page_doc = fitz.open()
+            single_page_doc.insert_pdf(doc, from_page=i, to_page=i)
+            page_bytes = single_page_doc.write()
+            single_page_doc.close()
+            tasks.append((blob_id, i, page_bytes, storage_settings))
             
-            # Proactively upload to remote storage so Vercel can see it
-            if storage_settings:
-                try:
-                    # Force leading slash if needed, or try both
-                    remote_image_path = f"pages/{image_filename}"
-                    print(f">>> [PIPELINE] Uploading page {page_num} to SFTP: {remote_image_path}")
-                    upload_to_remote(image_path, remote_image_path, storage_settings)
-                except Exception as ue:
-                    print(f"!!! [PIPELINE ERROR] Page upload failed: {ue}")
-            
-            anomalies, blur_score, skew = scan_health_check(image_path)
-            pdf_text = page.get_text("text").strip()
-            
-            try:
-                if len(pdf_text) > 20:
-                    ocr_text = pdf_text
-                    res = "NativeTextExtractor"
-                else:
-                    ocr_reader = get_reader()
-                    res = ocr_reader.readtext(image_path)
-                    ocr_text = "\n".join([item[1] for item in res]) if res else ""
-            except:
-                ocr_text, res = "", None
+        doc.close()
 
-            text_blocks = [{'text': item[1], 'confidence': item[2]} for item in res] if (res and res != "NativeTextExtractor") else [{'text': ocr_text, 'confidence': 1.0}]
-            ai_label, fuzzy_confidence = classify_page(text_blocks)
-            confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
-            should_flag = confidence < 0.85 or len(anomalies) > 0
-            extracted = extract_entities(ocr_text, ai_label)
-            
-            page_records.append({
-                "page_index": i, "s3_path": image_filename, "ai_label": ai_label,
-                "confidence_score": confidence, "is_flagged": should_flag,
-                "anomaly_flags": json.dumps(anomalies), "extracted_data": json.dumps(extracted)
-            })
-            print(f"Page {page_num}: {ai_label} (Conf: {confidence})")
+        # Execute OCR and processing tasks concurrently using ThreadPoolExecutor
+        page_records_temp = []
+        with ThreadPoolExecutor(max_workers=MAX_PAGE_WORKERS) as executor:
+            futures = {executor.submit(process_single_page, task): task[1] for task in tasks}
+            for future in as_completed(futures):
+                p_idx = futures[future]
+                try:
+                    res_record = future.result()
+                    page_records_temp.append(res_record)
+                    print(f"Finished page {p_idx+1}/{num_pages}")
+                except Exception as exc:
+                    print(f"Page {p_idx+1} generated an exception: {exc}")
+
+        # Ensure database arrays remain in correct chronological order
+        page_records = sorted(page_records_temp, key=lambda x: x['page_index'])
+        wait_for_page_uploads(page_records)
 
         try:
             r = requests.post(f"{BACKEND_URL}/api/blobs/{blob_id}/pages", json={"pages": page_records}, timeout=30)
-            print(f">>> [CALLBACK] POST /api/blobs/{blob_id}/pages -> {r.status_code} {r.text}")
+            print(f">>> [CALLBACK] POST /api/blobs/{blob_id}/pages -> {r.status_code}")
         except Exception as cb_e:
-            print(f">>> [CALLBACK ERROR] Failed to POST pages to backend: {cb_e}")
+            print(f">>> [CALLBACK ERROR] Callback failed: {cb_e}")
 
         try:
             r2 = requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"}, timeout=10)
-            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code} {r2.text}")
+            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code}")
         except Exception as cb_e:
-            print(f">>> [CALLBACK ERROR] Failed to PATCH backend status: {cb_e}")
-        doc.close()
+            print(f">>> [CALLBACK ERROR] Callback status patch failed: {cb_e}")
+            
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
         print(f"[ERROR] Pipeline failed: {e}\n{tb}")
         try:
-            requests.patch(
-                f"{BACKEND_URL}/api/blobs/{blob_id}",
-                json={"status": "FAILED", "error": str(e), "trace": tb}
-            )
-        except Exception as notify_err:
-            print(f"[ERROR] Failed to notify backend of failure: {notify_err}")
+            requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED", "error": str(e), "trace": tb})
+        except: pass
 
 def run_pipeline_append(blob_id: str, pdf_path: str, page_offset: int, storage_settings: Optional[Dict[str, Any]] = None):
-    """Processes a new file and appends its pages to an existing blob, starting from page_offset."""
+    # (Similarly refactored for rapid page execution)
     try:
-        print(f">>> [APPEND] Starting for Blob: {blob_id}, offset: {page_offset}")
-        if not os.path.exists(pdf_path):
-            print(f"!!! [APPEND ERROR] File does not exist: {pdf_path}")
-            return
+        print(f">>> [APPEND] Starting fast track for Blob: {blob_id}, offset: {page_offset}")
+        if not os.path.exists(pdf_path): return
 
-        # Decrypt file before opening
         decrypted_path = pdf_path + ".dec"
         decrypt_file(pdf_path, decrypted_path)
 
         doc = fitz.open(decrypted_path)
-        print(f">>> [APPEND] PDF opened. New pages: {len(doc)}")
-        page_records = []
+        num_pages = len(doc)
+        
+        tasks = []
+        for i in range(num_pages):
+            single_page_doc = fitz.open()
+            single_page_doc.insert_pdf(doc, from_page=i, to_page=i)
+            page_bytes = single_page_doc.write()
+            single_page_doc.close()
+            # Offset absolute indices for storage records
+            tasks.append((blob_id, page_offset + i, page_bytes, storage_settings))
+            
+        doc.close()
 
-        for i in range(len(doc)):
-            abs_index = page_offset + i          # absolute index in the blob
-            page_num = abs_index + 1             # 1-based, unique per blob
-
-            page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            image_filename = f"{blob_id}_{page_num}.png"
-            image_path = os.path.join(PAGES_DIR, image_filename)
-            pix.save(image_path)
-
-            if storage_settings:
+        page_records_temp = []
+        with ThreadPoolExecutor(max_workers=MAX_PAGE_WORKERS) as executor:
+            futures = {executor.submit(process_single_page, task): task[1] for task in tasks}
+            for future in as_completed(futures):
+                p_idx = futures[future]
                 try:
-                    upload_to_remote(image_path, f"pages/{image_filename}", storage_settings)
-                except Exception as ue:
-                    print(f"!!! [APPEND] Page upload failed: {ue}")
+                    res_record = future.result()
+                    page_records_temp.append(res_record)
+                except Exception as exc:
+                    print(f"Append Page {p_idx} error: {exc}")
 
-            anomalies, blur_score, skew = scan_health_check(image_path)
-            pdf_text = page.get_text("text").strip()
+        page_records = sorted(page_records_temp, key=lambda x: x['page_index'])
+        wait_for_page_uploads(page_records)
 
-            try:
-                if len(pdf_text) > 20:
-                    ocr_text = pdf_text
-                    res = "NativeTextExtractor"
-                else:
-                    ocr_reader = get_reader()
-                    res = ocr_reader.readtext(image_path)
-                    ocr_text = "\n".join([item[1] for item in res]) if res else ""
-            except:
-                ocr_text, res = "", None
-
-            text_blocks = [{'text': item[1], 'confidence': item[2]} for item in res] if (res and res != "NativeTextExtractor") else [{'text': ocr_text, 'confidence': 1.0}]
-            ai_label, fuzzy_confidence = classify_page(text_blocks)
-            confidence = fuzzy_confidence if res else max(fuzzy_confidence - 0.1, 0.0)
-            should_flag = confidence < 0.85 or len(anomalies) > 0
-            extracted = extract_entities(ocr_text, ai_label)
-
-            page_records.append({
-                "page_index": abs_index,
-                "s3_path": image_filename,
-                "ai_label": ai_label,
-                "confidence_score": confidence,
-                "is_flagged": should_flag,
-                "anomaly_flags": json.dumps(anomalies),
-                "extracted_data": json.dumps(extracted)
-            })
-            print(f"[APPEND] Page {abs_index}: {ai_label} (Conf: {confidence})")
-
-        # Post back with mode=append so existing pages are NOT deleted
         try:
-            r = requests.post(
-                f"{BACKEND_URL}/api/blobs/{blob_id}/pages",
-                json={"pages": page_records, "mode": "append"},
-                timeout=30
-            )
-            print(f">>> [CALLBACK] POST /api/blobs/{blob_id}/pages (append) -> {r.status_code} {r.text}")
+            r = requests.post(f"{BACKEND_URL}/api/blobs/{blob_id}/pages", json={"pages": page_records, "mode": "append"}, timeout=30)
         except Exception as cb_e:
-            print(f">>> [CALLBACK ERROR] Failed to POST append pages to backend: {cb_e}")
+            print(f">>> [CALLBACK ERROR] Append callback failed: {cb_e}")
 
         try:
             r2 = requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "COMPLETED"}, timeout=10)
-            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code} {r2.text}")
+            print(f">>> [CALLBACK] PATCH /api/blobs/{blob_id} -> {r2.status_code}")
         except Exception as cb_e:
-            print(f">>> [CALLBACK ERROR] Failed to PATCH backend status: {cb_e}")
-        doc.close()
-        print(f">>> [APPEND] Done. Added {len(page_records)} pages to blob {blob_id}")
+            print(f">>> [CALLBACK ERROR] Status patch failed: {cb_e}")
+            
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
-        print(f"[APPEND ERROR] Pipeline failed: {e}\n{tb}")
         try:
-            requests.patch(
-                f"{BACKEND_URL}/api/blobs/{blob_id}",
-                json={"status": "FAILED", "error": str(e), "trace": tb}
-            )
-        except Exception as notify_err:
-            print(f"[APPEND ERROR] Failed to notify backend of failure: {notify_err}")
+            requests.patch(f"{BACKEND_URL}/api/blobs/{blob_id}", json={"status": "FAILED", "error": str(e), "trace": tb})
+        except: pass
 
 
 if __name__ == "__main__":

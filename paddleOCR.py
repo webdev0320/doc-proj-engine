@@ -12,16 +12,7 @@ DOCUMENT_TYPES = {
         "hud gfe",
         "gfe form"
     ],
-    "URLA": [
-        "uniform residential loan application",
-        "urla form",
-        "1003",
-        "freddie mac form 65",
-        "fannie mae form 1003",
-        "uniform residential loan application urla",
-        "residential loan application"
-    ],
-    "TIA": [
+    "4506": [
         "tax information authorization",
         "tax information authorization form",
         "irs form 4506",
@@ -35,6 +26,64 @@ DOCUMENT_TYPES = {
         "loan submission sheet lss",
         "submission sheet",
         "loan transmittal sheet"
+    ],
+    "BANK_STATEMENT": [
+        "bank statement",
+        "bank statements",
+        "statement of account",
+        "account statement",
+        "bank account statement"
+    ],
+    "CREDIT_AUTHORIZATION": [
+        "credit authorization form",
+        "credit authorization",
+        "authorization to obtain credit",
+        "credit inquiry authorization"
+    ],
+    "BORROWER_CERTIFICATION_AUTHORIZATION": [
+        "borrower's certification authorization",
+        "borrower's certification & authorization",
+        "borrower certification authorization",
+        "borrower certification & authorization",
+        "borrower certification",
+        "borrower certification form"
+    ],
+    "BORROWER_CONSENT_TAX_RETURN": [
+        "borrower consent to tax return",
+        "borrower consent to the use of tax return information",
+        "borrower consent to tax returns",
+        "consent to tax return",
+        "tax return consent"
+    ],
+    "BORROWER_APPLICATION_CERTIFICATION": [
+        "borrower application certification",
+        "borrower application certification form",
+        "application certification",
+        "borrower application certification statement"
+    ],
+    "TITLE_POLICY": [
+        "title policy",
+        "title insurance policy",
+        "title policy document",
+        "title report"
+    ],
+    "MAVENT_REPORT": [
+        "mavent report",
+        "mavent reports"
+    ],
+    "CREDIT_REPORT": [
+        "credit report",
+        "consumer credit report",
+        "credit history report",
+        "credit agency",
+        "advantage credit"
+    ],
+    "DRIVER_LICENSE": [
+        "driver licence",
+        "driver license",
+        "driver's license",
+        "driver identification",
+        "driver id"
     ],
     
     # New documents added
@@ -134,6 +183,17 @@ DOCUMENT_TYPES = {
         "air certificate",
         "appraiser independence requirements certificate",
         "certificate of appraiser independence form"
+    ],
+    "URLA": [
+        "uniform residential loan application",
+        #"urla form",
+        "loan application",
+        "loan application form",
+        "1003",   # Check this
+        "freddie mac form 65",
+        "fannie mae form 1003",
+        "uniform residential loan application urla",
+        "residential loan application"
     ]
 }
 
