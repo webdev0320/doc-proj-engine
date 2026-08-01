@@ -1,22 +1,21 @@
 # Classification module — no OCR dependency.
 # Uses rapidfuzz for fuzzy keyword matching against DOCUMENT_TYPES.
 from rapidfuzz import fuzz
+import re
 import traceback
 
 # document dictionary
 DOCUMENT_TYPES = {
-    # Existing documents with additional aliases
     "GFE": [
         "good faith estimate",
         "good faith estimate gfe",
-        "hud gfe",
-        "gfe form"
+        "hud-1 gfe",
+        "gfe form hud"
     ],
     "4506": [
         "tax information authorization",
         "tax information authorization form",
         "irs form 4506",
-        "4506",
         "irs 4506",
         "form 4506",
         "tax return authorization"
@@ -32,7 +31,13 @@ DOCUMENT_TYPES = {
         "bank statements",
         "statement of account",
         "account statement",
-        "bank account statement"
+        "bank account statement",
+        "account summary",
+        "transaction history",
+        "available balance",
+        "statement period",
+        "beginning balance",
+        "ending balance"
     ],
     "CREDIT_AUTHORIZATION": [
         "credit authorization form",
@@ -45,7 +50,6 @@ DOCUMENT_TYPES = {
         "borrower's certification & authorization",
         "borrower certification authorization",
         "borrower certification & authorization",
-        "borrower certification",
         "borrower certification form"
     ],
     "BORROWER_CONSENT_TAX_RETURN": [
@@ -58,36 +62,67 @@ DOCUMENT_TYPES = {
     "BORROWER_APPLICATION_CERTIFICATION": [
         "borrower application certification",
         "borrower application certification form",
-        "application certification",
         "borrower application certification statement"
     ],
+    "ESCROW_INSTRUCTIONS": [
+        "escrow instructions",
+        "escrow closing instructions",
+        "preliminary change of ownership report",
+        "escrow instructions for",
+        "escrow instructions and closing",
+        "closing instructions",
+        "escrow company instructions",
+        "title and escrow instructions",
+        "escrow direction letter"
+    ],
     "TITLE_POLICY": [
-        "title policy",
         "title insurance policy",
+        "title commitment",
         "title policy document",
         "title report"
     ],
     "MAVENT_REPORT": [
         "mavent report",
-        "mavent reports"
+        "mavent compliance",
+        "compliance analysis report",
+        "trid compliance",
+        "respa compliance",
+        "tila compliance",
+        "regulation z compliance",
+        "hmda compliance report",
+        "ability to repay",
+        "ability-to-repay",
+        "qm atr analysis",
+        "closing disclosure compliance",
+        "loan estimate compliance",
+        "mavent analsis",
+        "mavent review"
     ],
     "CREDIT_REPORT": [
-        "credit report",
         "consumer credit report",
         "credit history report",
-        "credit agency",
-        "advantage credit"
+        "transunion",
+        "equifax",
+        "experian",
+        "fico score",
+        "credit score",
+        "trade line",
+        "account history",
+        "payment history",
+        "credit inquiry",
+        "inquiry history",
+        "public records",
+        "credit summary",
+        "revolving account",
+        "installment account"
     ],
     "DRIVER_LICENSE": [
         "driver licence",
         "driver license",
         "driver's license",
-        "driver identification",
-        "driver id"
+        "driver identification"
     ],
-    
-    # New documents added
-    "DEMO": [  # Demographic Information Addendum
+    "DEMO": [
         "demographic information addendum",
         "demographic addendum",
         "hmda demographic information addendum",
@@ -95,57 +130,49 @@ DOCUMENT_TYPES = {
         "borrower demographic information",
         "demographic information form"
     ],
-    "UUTS": [  # Uniform Underwriting and Transmittal Summary
+    "UUTS": [
         "uniform underwriting and transmittal summary",
         "uniform underwriting transmittal summary",
         "fannie mae form 1077",
         "freddie mac form 1008",
-        "form 1077",
-        "form 1008",
         "underwriting and transmittal summary",
         "uw transmittal summary"
     ],
-    "RTTR": [  # Request for Transcript of Tax Return
+    "RTTR": [
         "request for transcript of tax return",
         "irs form 4506-c",
         "form 4506-c",
-        "4506-c",
         "irs 4506c",
         "request for tax return transcript",
         "tax transcript request",
         "irs tax return transcript request",
         "form 4506c"
     ],
-    "URAR": [  # Uniform Residential Appraisal Report
+    "URAR": [
         "uniform residential appraisal report",
-        "urar",
         "fannie mae form 1004",
         "freddie mac form 70",
-        "form 1004",
-        "form 70",
         "uniform appraisal report",
         "residential appraisal report",
         "1004 appraisal form"
     ],
-    "SA": [  # Supplemental Addendum
+    "SA": [
         "supplemental addendum",
         "multi purpose supplemental addendum",
         "supplemental appraisal addendum",
         "form 1004 supplemental addendum",
-        "urar supplemental addendum",
         "appraisal supplemental addendum"
     ],
-    "MCA": [  # Market Conditions Addendum to the Appraisal Report
+    "MCA": [
         "market conditions addendum to the appraisal report",
         "market conditions addendum",
         "fannie mae form 1004mc",
         "form 1004mc",
         "1004mc",
         "market conditions addendum appraisal",
-        "appraisal market conditions addendum",
-        "market conditions addendum urar"
+        "appraisal market conditions addendum"
     ],
-    "UAD_DEF": [  # UNIFORM APPRAISAL DATASET (UAD) DEFINITIONS ADDENDUM
+    "UAD_DEF": [
         "uniform appraisal dataset definitions addendum",
         "uad definitions addendum",
         "uniform appraisal dataset definitions",
@@ -154,8 +181,8 @@ DOCUMENT_TYPES = {
         "form 1004 uad definitions addendum",
         "uad appraisal definitions addendum"
     ],
-    "E&O": [  # REAL ESTATE APPRAISERS ERRORS & OMISSIONS INSURANCE POLICY DECLARATIONS PAGE
-        "real estate appraisers errors & omissions insurance policy declarations page",
+    "E&O": [
+        "errors & omissions insurance policy declarations page",
         "eo insurance policy declarations page",
         "appraisers errors and omissions insurance declarations",
         "eo declarations page",
@@ -163,39 +190,35 @@ DOCUMENT_TYPES = {
         "errors and omissions insurance policy appraisers",
         "appraiser e&o policy declarations"
     ],
-    "APP_LICENSE": [  # REAL ESTATE APPRAISER LICENSE
+    "APP_LICENSE": [
         "real estate appraiser license",
-        "appraiser license",
-        "appraisal license",
         "state appraiser license",
-        "appraiser certification",
         "certified real estate appraiser license",
         "professional appraiser license",
         "appraiser license certificate",
         "state certified appraiser license"
     ],
-    "COA": [  # Certificate of Appraiser Independence
+    "COA": [
         "certificate of appraiser independence",
         "appraiser independence certificate",
-        "coa",
-        "certificate of independence appraiser",
         "appraiser independence certification",
-        "air certificate",
         "appraiser independence requirements certificate",
         "certificate of appraiser independence form"
     ],
     "URLA": [
         "uniform residential loan application",
-        #"urla form",
-        "loan application",
-        "loan application form",
-        "1003",   # Check this
         "freddie mac form 65",
         "fannie mae form 1003",
         "uniform residential loan application urla",
         "residential loan application"
     ]
 }
+
+# Keywords that must appear as standalone words (not substrings) to avoid false positives
+_STRICT_KEYWORDS = {"COA", "URLA"}
+
+# Minimum keyword length to prevent over-fuzzy matching
+_MIN_KEYWORD_LEN = 5
 
 
 def classify_page(text_blocks):
@@ -217,17 +240,160 @@ def classify_page(text_blocks):
 
     for doc_type, keywords in DOCUMENT_TYPES.items():
         for keyword in keywords:
-            score = fuzz.partial_ratio(keyword, full_text)
+            kw_lower = keyword.lower()
+            # For strict keyword types, require whole-word match to avoid false positives
+            if doc_type in _STRICT_KEYWORDS and len(kw_lower) <= 4:
+                # Use token_set_ratio for short keywords to avoid substring false positives
+                if re.search(r'\b' + re.escape(kw_lower) + r'\b', full_text):
+                    score = 95
+                else:
+                    continue
+            elif len(kw_lower) < _MIN_KEYWORD_LEN:
+                # Skip overly short keywords that cause false matches
+                continue
+            else:
+                score = fuzz.partial_ratio(kw_lower, full_text)
 
             if score > best_score:
                 best_score = score
                 best_match = doc_type
 
-    # Threshold check: score must exceed 80 to be considered a match
     if best_score > 80:
         return best_match, round(best_score / 100, 2)
     else:
         return "UNCLASSIFIED", round(best_score / 100, 2)
+
+
+def _detect_page_of_pattern(text):
+    """Detect 'Page X of Y' or 'X/Y' patterns at bottom of page text."""
+    patterns = [
+        r'page\s+(\d+)\s+of\s+(\d+)',
+        r'(\d+)\s*/\s*(\d+)',
+        r'page\s+(\d+)\s+/\s*(\d+)',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None, None
+
+
+def classify_documents(pages_data):
+    """
+    Context-aware document classifier. Takes per-page classification results
+    and applies multi-page grouping, neighbor propagation, and confidence boosting.
+
+    Args:
+        pages_data: list of dicts, each with keys:
+            - page_index (int)
+            - text (str): full OCR/native text for the page
+            - ai_label (str): per-page classification label
+            - confidence_score (float): per-page confidence
+
+    Returns:
+        list of dicts with updated 'ai_label' and 'confidence_score'
+    """
+    if not pages_data:
+        return pages_data
+
+    # Step 1: Per-page re-classification using text (already done before calling this)
+
+    # Step 2: Detect multi-page document boundaries via "Page X of Y" patterns
+    page_groups = {}  # group_id -> set of page indices
+    group_lookup = {}  # page_index -> group_id
+    group_counter = 0
+
+    for page in pages_data:
+        text = page.get('text', '')
+        current, total = _detect_page_of_pattern(text)
+        if current is not None and total is not None and total > 1:
+            # Find if any neighbor is already in a group for this document
+            idx = page['page_index']
+            found_group = None
+            for neighbor_idx in range(max(0, idx - total), min(len(pages_data), idx + total)):
+                if neighbor_idx in group_lookup:
+                    found_group = group_lookup[neighbor_idx]
+                    break
+
+            if found_group is not None:
+                group_lookup[idx] = found_group
+                page_groups[found_group].add(idx)
+            else:
+                gid = group_counter
+                group_counter += 1
+                page_groups[gid] = {idx}
+                group_lookup[idx] = gid
+
+    # For pages in a group, assign the type from the highest-confidence page
+    for gid, members in page_groups.items():
+        if len(members) < 2:
+            continue
+        member_pages = [p for p in pages_data if p['page_index'] in members]
+        # Find the best label by confidence
+        best = max(member_pages, key=lambda p: p['confidence_score'])
+        best_label = best['ai_label']
+        # Only override if majority isn't already the same type
+        label_counts = {}
+        for p in member_pages:
+            label_counts[p['ai_label']] = label_counts.get(p['ai_label'], 0) + 1
+        if label_counts.get(best_label, 0) >= len(member_pages) // 2:
+            for p in member_pages:
+                p['ai_label'] = best_label
+                p['confidence_score'] = max(p['confidence_score'], 0.90)
+
+    # Step 3: Consecutive same-type boosting
+    # If 3+ consecutive pages share a type, boost confidence for that group
+    i = 0
+    while i < len(pages_data):
+        j = i
+        while j < len(pages_data) and pages_data[j]['ai_label'] == pages_data[i]['ai_label']:
+            j += 1
+        run_len = j - i
+        if run_len >= 3 and pages_data[i]['ai_label'] != "UNCLASSIFIED":
+            for k in range(i, j):
+                pages_data[k]['confidence_score'] = max(pages_data[k]['confidence_score'], 0.92)
+        i = j
+
+    # Step 4: Neighbor propagation for low-confidence pages
+    # If a page has low confidence and both neighbors agree on a different type, override
+    for i in range(1, len(pages_data) - 1):
+        if pages_data[i]['confidence_score'] >= 0.88:
+            continue
+        prev_label = pages_data[i - 1]['ai_label']
+        next_label = pages_data[i + 1]['ai_label']
+        if prev_label == next_label and prev_label != pages_data[i]['ai_label'] and prev_label != "UNCLASSIFIED":
+            pages_data[i]['ai_label'] = prev_label
+            pages_data[i]['confidence_score'] = 0.88
+
+    # Step 5: Island detection — single page different from surrounding same-type pages
+    for i in range(1, len(pages_data) - 1):
+        if pages_data[i]['confidence_score'] >= 0.90:
+            continue
+        # Check if surrounded by same type
+        prev_label = pages_data[i - 1]['ai_label']
+        next_label = pages_data[i + 1]['ai_label'] if i + 1 < len(pages_data) else None
+        curr_label = pages_data[i]['ai_label']
+        if prev_label == curr_label:
+            continue  # Not an island
+        if prev_label == next_label and prev_label != curr_label and prev_label != "UNCLASSIFIED":
+            # Check if there's more context (2+ pages of same type on each side)
+            left_count = 0
+            for k in range(i - 1, -1, -1):
+                if pages_data[k]['ai_label'] == prev_label:
+                    left_count += 1
+                else:
+                    break
+            right_count = 0
+            for k in range(i + 1, len(pages_data)):
+                if pages_data[k]['ai_label'] == next_label:
+                    right_count += 1
+                else:
+                    break
+            if left_count >= 2 and right_count >= 2:
+                pages_data[i]['ai_label'] = prev_label
+                pages_data[i]['confidence_score'] = 0.87
+
+    return pages_data
 
 
 

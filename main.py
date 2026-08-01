@@ -19,7 +19,7 @@ from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from paddleOCR import classify_page
+from paddleOCR import classify_page, classify_documents
 from crypto_utils import decrypt_file
 from dotenv import load_dotenv
 
@@ -416,6 +416,25 @@ def _extract_ls(text):
         if val: data[key] = val
     return data
 
+def _extract_escrow(text):
+    data = {}
+    fields = {
+        "Escrow Company": r"(?:Escrow\s+Company|Title\s+Company|Escrow\s+Holder)\s*:?\s*\n?([^\n]+)",
+        "Estimated Close Date": r"(?:Estimated\s+Close|Closing\s+Date|Close\s+of\s+Escrow)\s*(?:of\s+Escrow)?\s*:?\s*\n?([^\n]+)",
+        "Buyer Name": r"(?:Buyer|Borrower)\s*(?:Name)?\s*:?\s*\n?([^\n]+)",
+        "Seller Name": r"(?:Seller|Grantor)\s*(?:Name)?\s*:?\s*\n?([^\n]+)",
+        "Property Address": r"(?:Property\s+Address|Property\s+Street|Property\s+Description)\s*:?\s*\n?([^\n]+(?:\n[^\n]{0,60})?)",
+        "Purchase Price": r"(?:Purchase\s+Price|Sales\s+Price|Total\s+Purchase)\s*\$?\s*:?\s*([\d,\.]+)",
+        "Loan Amount": r"(?:Loan\s+Amount|Amount\s+of\s+Loan|Deed\s+of\s+Trust)\s*\$?\s*:?\s*([\d,\.]+)",
+        "Title Company": r"(?:Title\s+Company|Title\s+Insurance)\s*:?\s*\n?([^\n]+)",
+        "Transaction Type": r"(?:Transaction\s+Type|Type\s+of\s+Transaction)\s*:?\s*\n?([^\n]+)",
+        "Lender": r"(?:Lender|Beneficiary|Mortgagee)\s*:?\s*\n?([^\n]+)",
+    }
+    for key, pattern in fields.items():
+        val = _extract_field(text, pattern)
+        if val: data[key] = val
+    return data
+
 def _extract_all_labels_values(ocr_text):
     data = {}
     if not ocr_text: return data
@@ -490,6 +509,8 @@ def extract_entities(ocr_text, doc_type):
         typed_data = _extract_tia(ocr_text)
     elif upper_doc == "LS":
         typed_data = _extract_ls(ocr_text)
+    elif upper_doc == "ESCROW_INSTRUCTIONS":
+        typed_data = _extract_escrow(ocr_text)
     data.update(typed_data)
     return data
 
@@ -645,7 +666,8 @@ def process_single_page(args):
         "confidence_score": confidence,
         "is_flagged": should_flag,
         "anomaly_flags": json.dumps(anomalies),
-        "extracted_data": json.dumps(extracted)
+        "extracted_data": json.dumps(extracted),
+        "ocr_text": ocr_text
     }
 
 def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[str, Any]] = None):
@@ -690,6 +712,16 @@ def run_pipeline(blob_id: str, pdf_path: str, storage_settings: Optional[Dict[st
 
         # Ensure database arrays remain in correct chronological order
         page_records = sorted(page_records_temp, key=lambda x: x['page_index'])
+
+        # Context-aware re-classification: pass text + labels to group documents
+        for rec in page_records:
+            rec['text'] = rec.get('ocr_text', '')
+        classify_documents(page_records)
+        # Clean up temporary text field before sending to backend
+        for rec in page_records:
+            rec.pop('text', None)
+            rec.pop('ocr_text', None)
+
         wait_for_page_uploads(page_records)
 
         try:
